@@ -3,10 +3,11 @@ Stage 0 — Pipeline Orchestrator
 Runs all data collectors in sequence, on a fixed hourly schedule.
 
 Usage:
-    python src/run_pipeline.py              # run once immediately
-    python src/run_pipeline.py --schedule   # run every hour on the hour (production mode)
-    python src/run_pipeline.py --market     # market data only (no social)
-    python src/run_pipeline.py --social     # social data only (no market)
+    python src/pipeline.py                  # run once immediately (all sources)
+    python src/pipeline.py --schedule       # run every hour on the hour (production)
+    python src/pipeline.py --market         # market data only
+    python src/pipeline.py --social         # reddit + news only (no market)
+    python src/pipeline.py --static         # load static datasets (PhraseBank + Kaggle)
 """
 
 import argparse
@@ -16,31 +17,40 @@ import sys
 import time
 from datetime import datetime, timezone
 
+from pandas import DataFrame
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.config import (
     COLLECTION_INTERVAL_MINUTES, TIMEZONE, LOG_FORMAT, LOG_LEVEL
 )
-from src.reddit_collector import run_reddit_collection
-from src.stockwits_collector import run_stocktwits_collection
-from src.marketdata_collector import run_market_data_collection# ── Logging setup ────────────────────────────────────────────────────────────
+from reddit_collector import run_reddit_collection
+from news_collector import run_news_collection
+from static_dataset_loader import run_static_dataset_loading
+
 logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
 logger = logging.getLogger("orchestrator")
 
 
-def run_all(run_social: bool = True, run_market: bool = True) -> dict:
-    """
-    Execute one full collection cycle.
-    Returns a summary dict with row counts per source.
-    """
+def run_all(run_social: bool = True, run_market: bool = True, run_static: bool = False) -> dict:
     run_ts = datetime.now(tz=TIMEZONE).strftime("%Y-%m-%d %H:%M:%S UTC")
     logger.info(f"═══ Pipeline run started at {run_ts} ═══")
-
     summary = {}
 
-    # ── Social data ──────────────────────────────────────────────────────
+    # ── Static datasets (run once manually, not on schedule) ─────────────
+    if run_static:
+        try:
+            logger.info("--- Loading Static Datasets (PhraseBank + Kaggle) ---")
+            static_data: DataFrame = run_static_dataset_loading()
+            summary["phrasebank_records"] = len(static_data.get("phrasebank", []))
+            summary["stocknews_records"] = len(static_data.get("stocknews", []))
+        except Exception as e:
+            logger.error(f"Static dataset loading failed: {e}", exc_info=True)
+            summary["static_records"] = 0
+
+    # ── Social / News data ───────────────────────────────────────────────
     if run_social:
         try:
-            logger.info("--- Collecting Reddit ---")
+            logger.info("--- Collecting Reddit (30-day historical) ---")
             reddit_df = run_reddit_collection()
             summary["reddit"] = len(reddit_df)
         except Exception as e:
@@ -48,25 +58,14 @@ def run_all(run_social: bool = True, run_market: bool = True) -> dict:
             summary["reddit"] = 0
 
         try:
-            logger.info("--- Collecting StockTwits ---")
-            st_df = run_stocktwits_collection()
-            summary["stocktwits"] = len(st_df)
+            logger.info("--- Collecting Financial News (RSS) ---")
+            news_df = run_news_collection()
+            summary["news"] = len(news_df)
         except Exception as e:
-            logger.error(f"StockTwits collection failed: {e}", exc_info=True)
-            summary["stocktwits"] = 0
+            logger.error(f"News collection failed: {e}", exc_info=True)
+            summary["news"] = 0
 
-    # ── Market data ──────────────────────────────────────────────────────
-    if run_market:
-        try:
-            logger.info("--- Collecting Market Data ---")
-            market_results = run_market_data_collection()
-            summary["market_tickers"] = sum(
-                len(v) for k, v in market_results.items() if k.startswith("prices_") and "_all" not in k
-            )
-            summary["vix_rows"] = len(market_results.get("vix", []))
-        except Exception as e:
-            logger.error(f"Market data collection failed: {e}", exc_info=True)
-            summary["market"] = 0
+
 
     finish_ts = datetime.now(tz=TIMEZONE).strftime("%Y-%m-%d %H:%M:%S UTC")
     logger.info(f"═══ Pipeline run complete at {finish_ts} ═══")
@@ -75,21 +74,15 @@ def run_all(run_social: bool = True, run_market: bool = True) -> dict:
 
 
 def seconds_until_next_hour() -> float:
-    """How many seconds until the top of the next hour (00:00 of next hour)."""
     now = datetime.now(tz=TIMEZONE)
     seconds_past_hour = now.minute * 60 + now.second + now.microsecond / 1_000_000
     return 3600 - seconds_past_hour
 
 
 def run_scheduled(run_social: bool = True, run_market: bool = True):
-    """
-    Production scheduler: waits until the top of the hour, then runs every hour.
-    Aligned collection windows = aligned timestamps = no lag problems later.
-    """
     wait = seconds_until_next_hour()
     logger.info(f"Scheduled mode: waiting {wait:.0f}s until next hour mark ...")
     time.sleep(wait)
-
     while True:
         cycle_start = time.time()
         run_all(run_social=run_social, run_market=run_market)
@@ -103,16 +96,21 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Stage 0 Pipeline Orchestrator")
     parser.add_argument("--schedule", action="store_true",
                         help="Run on fixed hourly schedule (production mode)")
-    parser.add_argument("--market", action="store_true",
-                        help="Run market data collection only")
-    parser.add_argument("--social", action="store_true",
-                        help="Run social data collection only")
+    parser.add_argument("--market",   action="store_true",
+                        help="Market data only")
+    parser.add_argument("--social",   action="store_true",
+                        help="Reddit + News only")
+    parser.add_argument("--static",   action="store_true",
+                        help="Load static datasets (PhraseBank + Kaggle) only")
     args = parser.parse_args()
 
-    run_social = not args.market   # if --market flag, skip social
-    run_market = not args.social   # if --social flag, skip market
+    # Determine what to run
+    only_static = args.static and not args.market and not args.social
+    run_social  = (not args.market and not only_static)
+    run_market  = (not args.social and not only_static)
+    run_static  = args.static
 
     if args.schedule:
         run_scheduled(run_social=run_social, run_market=run_market)
     else:
-        run_all(run_social=run_social, run_market=run_market)
+        run_all(run_social=run_social, run_market=run_market, run_static=run_static)

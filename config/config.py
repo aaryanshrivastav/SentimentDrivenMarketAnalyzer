@@ -40,8 +40,8 @@ REDDIT_SUBREDDITS = [
     # India
     "IndiaInvestments", "DalalStreetTalks", "IndianStockMarket",
 ]
-REDDIT_POST_LIMIT    = 500   # posts per subreddit per pull
-REDDIT_COMMENT_LIMIT = 100   # top-level comments per post
+REDDIT_POST_LIMIT    = 50   # posts per subreddit per pull
+REDDIT_COMMENT_LIMIT = 20   # top-level comments per post
 
 # ─────────────────────────────────────────────
 # STOCKTWITS
