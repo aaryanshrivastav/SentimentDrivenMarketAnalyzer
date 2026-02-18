@@ -1,0 +1,32 @@
+# Stage 0 — Data Collection
+praw==7.7.1                  # Reddit API
+requests==2.31.0             # StockTwits HTTP requests
+yfinance             # Market data: OHLCV, VIX, earnings
+pandas==2.1.4
+numpy==1.26.3
+
+# Stage 1A — Cleaning & NER
+spacy==3.7.2                 # Named entity recognition
+# After install, also run: python -m spacy download en_core_web_sm
+
+# Stage 1B — Sentiment Models
+transformers==4.37.2         # FinBERT + RoBERTa sarcasm model
+torch==2.1.2                 # PyTorch backend for HuggingFace
+# GPU users: replace with torch==2.1.2+cu118 from pytorch.org
+
+# Stage 2A — Technical Indicators
+TA-Lib          # RSI, MACD, Bollinger Bands, ATR
+# Note: TA-Lib requires C library — see README for platform install instructions
+
+# Stage 2B — Granger Causality
+statsmodels==0.14.1
+
+# Stage 3 — Models
+xgboost==2.0.3
+scikit-learn==1.4.0          # preprocessing, metrics, walk-forward helpers
+# PyTorch above covers LSTM
+
+# Utilities
+python-dotenv==1.0.0         # Load .env file for API credentials
+tqdm==4.66.1                 # Progress bars
+pytz==2024.1                 # Timezone handling
