@@ -170,7 +170,7 @@ def collect_subreddit_historical(subreddit_name: str) -> list[dict]:
     all_records = []
     posts_per_query = max(10, REDDIT_POST_LIMIT // len(SEARCH_QUERIES))
 
-    logger.info(f"Collecting r/{subreddit_name} — {len(SEARCH_QUERIES)} queries × {posts_per_query} posts each")
+    logger.info(f"Collecting r/{subreddit_name} — {len(SEARCH_QUERIES)} queries x {posts_per_query} posts each")
 
     for query in SEARCH_QUERIES:
         logger.info(f"  Searching r/{subreddit_name} for '{query}'")
@@ -200,13 +200,13 @@ def run_reddit_collection() -> pd.DataFrame:
 
     before = len(df)
     df.drop_duplicates(subset=["id"], inplace=True)
-    logger.info(f"Deduplicated: {before} → {len(df)} records")
+    logger.info(f"Deduplicated: {before} to {len(df)} records")
 
     timestamp_tag = datetime.now(tz=TIMEZONE).strftime("%Y%m%d_%H%M%S")
     out_path = os.path.join(RAW_DATA_DIR, f"reddit_raw_{timestamp_tag}.csv")
     os.makedirs(RAW_DATA_DIR, exist_ok=True)
     df.to_csv(out_path, index=False)
-    logger.info(f"Saved → {out_path} ({len(df)} records)")
+    logger.info(f"Saved to {out_path} ({len(df)} records)")
     return df
 
 

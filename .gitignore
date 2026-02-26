@@ -1,6 +1,89 @@
-data/raw
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+*.pyc
+*.pyo
+
+# Virtual Environments
 venv/
+.venv/
+.venv311/
+env/
+ENV/
+virtualenv/
+
+# Data Directories
+data/raw/
+data/processed/
+data/market/*.csv
+
+# Models & Weights
+models/*.pt
+models/*.pkl
+finbert_finetuned/
+finbert_finetuned_2/
+
+# Cache & Temporary
 cache/
-__pycache__
+*.cache
+*.tmp
+tmp_trainer/
+
+# Output & Results
+output/
+*.backup
+ablation_results.csv
+
+# IDE & Editors
 .vscode/
-.venv311
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# OS Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Frontend (Node.js)
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+frontend/.turbo/
+frontend/.vercel
+
+# Keep structure
+!data/.gitkeep
+!models/.gitkeep
+!output/.gitkeep
+!cache/.gitkeep

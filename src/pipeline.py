@@ -23,9 +23,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.config import (
     COLLECTION_INTERVAL_MINUTES, TIMEZONE, LOG_FORMAT, LOG_LEVEL
 )
-from reddit_collector import run_reddit_collection
-from news_collector import run_news_collection
-from static_dataset_loader import run_static_dataset_loading
+from src.data_collection.reddit_collector import run_reddit_collection
+from src.data_collection.news_collector import run_news_collection
+from src.utils.static_dataset_loader import run_static_dataset_loading
 
 logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
 logger = logging.getLogger("orchestrator")

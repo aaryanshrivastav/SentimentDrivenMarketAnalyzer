@@ -100,7 +100,7 @@ def clean_file(input_path: str, output_path: str) -> int:
         logger.info(f"  Dropped {dropped} short/empty rows")
 
     df.to_csv(output_path, index=False)
-    logger.info(f"  Saved {len(df)} rows → {os.path.basename(output_path)}")
+    logger.info(f"  Saved {len(df)} rows to {os.path.basename(output_path)}")
     return len(df)
 
 

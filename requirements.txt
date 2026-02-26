@@ -7,11 +7,13 @@ numpy==1.26.3
 
 # Stage 1A — Cleaning & NER
 spacy==3.7.2                 # Named entity recognition
+typer==0.9.4               # Fix dependency conflict with typer-slim
 # After install, also run: python -m spacy download en_core_web_sm
 
 # Stage 1B — Sentiment Models
 transformers==4.37.2         # FinBERT + RoBERTa sarcasm model
 torch==2.1.2                 # PyTorch backend for HuggingFace
+accelerate>=0.26.0
 # GPU users: replace with torch==2.1.2+cu118 from pytorch.org
 
 # Stage 2A — Technical Indicators
@@ -30,3 +32,7 @@ scikit-learn==1.4.0          # preprocessing, metrics, walk-forward helpers
 python-dotenv==1.0.0         # Load .env file for API credentials
 tqdm==4.66.1                 # Progress bars
 pytz==2024.1                 # Timezone handling
+
+# API Server (for frontend integration)
+fastapi==0.109.0            # REST API framework
+uvicorn[standard]==0.27.0   # ASGI server for FastAPI

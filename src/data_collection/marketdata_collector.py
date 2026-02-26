@@ -55,7 +55,7 @@ def fetch_ohlcv(ticker: str, period: str = None, interval: str = None) -> pd.Dat
     df["ticker"] = ticker
     df["timestamp_utc"] = df["timestamp_utc"].dt.strftime(TIMESTAMP_FORMAT)
 
-    logger.info(f"{ticker}: {len(df)} rows ({df['timestamp_utc'].iloc[0]} → {df['timestamp_utc'].iloc[-1]})")
+    logger.info(f"{ticker}: {len(df)} rows ({df['timestamp_utc'].iloc[0]} to {df['timestamp_utc'].iloc[-1]})")
     return df
 
 
@@ -163,7 +163,7 @@ def run_market_data_collection(tickers: list = None) -> dict:
             price_frames.append(df)
             path = os.path.join(MARKET_DATA_DIR, f"prices_{ticker.replace('.', '_')}_{timestamp_tag}.csv")
             df.to_csv(path, index=False)
-            logger.info(f"Saved → {path}")
+            logger.info(f"Saved to {path}")
         results[f"prices_{ticker}"] = df
 
     if price_frames:
@@ -171,14 +171,14 @@ def run_market_data_collection(tickers: list = None) -> dict:
         combined_path = os.path.join(MARKET_DATA_DIR, f"prices_all_{timestamp_tag}.csv")
         combined.to_csv(combined_path, index=False)
         results["prices_all"] = combined
-        logger.info(f"Combined prices saved → {combined_path}")
+        logger.info(f"Combined prices saved to {combined_path}")
 
     # ── US VIX ───────────────────────────────────────────────────────────
     vix_df = fetch_volatility_index(VIX_TICKER, "US_VIX")
     if not vix_df.empty:
         vix_path = os.path.join(MARKET_DATA_DIR, f"vix_{timestamp_tag}.csv")
         vix_df.to_csv(vix_path, index=False)
-        logger.info(f"US VIX saved → {vix_path}")
+        logger.info(f"US VIX saved to {vix_path}")
     results["vix"] = vix_df
 
     # ── India VIX ────────────────────────────────────────────────────────
@@ -186,7 +186,7 @@ def run_market_data_collection(tickers: list = None) -> dict:
     if not india_vix_df.empty:
         india_vix_path = os.path.join(MARKET_DATA_DIR, f"india_vix_{timestamp_tag}.csv")
         india_vix_df.to_csv(india_vix_path, index=False)
-        logger.info(f"India VIX saved → {india_vix_path}")
+        logger.info(f"India VIX saved to {india_vix_path}")
     results["india_vix"] = india_vix_df
 
     # ── Broad Indices (NIFTY50, SENSEX, S&P500, NASDAQ) ─────────────────
@@ -194,7 +194,7 @@ def run_market_data_collection(tickers: list = None) -> dict:
     if not indices_df.empty:
         indices_path = os.path.join(MARKET_DATA_DIR, f"indices_{timestamp_tag}.csv")
         indices_df.to_csv(indices_path, index=False)
-        logger.info(f"Indices saved → {indices_path}")
+        logger.info(f"Indices saved to {indices_path}")
     results["indices"] = indices_df
 
     # ── Earnings dates ────────────────────────────────────────────────────
@@ -210,7 +210,7 @@ def run_market_data_collection(tickers: list = None) -> dict:
         results["earnings"] = earnings_all
         earnings_path = os.path.join(MARKET_DATA_DIR, "earnings_all.csv")
         earnings_all.to_csv(earnings_path, index=False)
-        logger.info(f"Earnings saved → {earnings_path}")
+        logger.info(f"Earnings saved to {earnings_path}")
 
     logger.info("Market data collection complete.")
     return results

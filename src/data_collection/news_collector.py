@@ -183,13 +183,13 @@ def run_news_collection() -> pd.DataFrame:
 
     before = len(df)
     df.drop_duplicates(subset=["id"], inplace=True)
-    logger.info(f"Deduplicated: {before} → {len(df)} news articles")
+    logger.info(f"Deduplicated: {before} to {len(df)} news articles")
 
     timestamp_tag = datetime.now(tz=TIMEZONE).strftime("%Y%m%d_%H%M%S")
     out_path = os.path.join(RAW_DATA_DIR, f"news_raw_{timestamp_tag}.csv")
     os.makedirs(RAW_DATA_DIR, exist_ok=True)
     df.to_csv(out_path, index=False)
-    logger.info(f"Saved → {out_path}")
+    logger.info(f"Saved to {out_path}")
 
     return df
 

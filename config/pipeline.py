@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.config import (
     COLLECTION_INTERVAL_MINUTES, TIMEZONE, LOG_FORMAT, LOG_LEVEL
 )
-from src.reddit_collector import run_reddit_collection
+from src.data_collection.reddit_collector import run_reddit_collection
 from src.stocktwits_collector import run_stocktwits_collection
 from src.market_data_collector import run_market_data_collection
 
