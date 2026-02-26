@@ -90,7 +90,7 @@ class PipelineConfig:
         # Stage 1 parameters
         self.window_freq = "1h"              # Hourly aggregation
         self.lag_windows = 1                 # 1-hour lag for non-leakage
-        self.finbert_model = "finbert_finetuned_2/best_model"  # Fine-tuned model path
+        self.finbert_model = "Arstacity/finbert-finetuned"  # HuggingFace model (or local path)
         self.sarcasm_threshold_flip = 0.65   # Flip sentiment if sarcasm > this
         self.sarcasm_threshold_uncertain = 0.40  # Between 0.40-0.65 = uncertain
         self.confidence_threshold = 0.70     # Minimum FinBERT confidence
@@ -1174,8 +1174,8 @@ def main():
     parser.add_argument(
         '--finbert-model',
         type=str,
-        default='finbert_finetuned_2/best_model',
-        help='FinBERT model path (default: finbert_finetuned_2/best_model)'
+        default='Arstacity/finbert-finetuned',
+        help='FinBERT model path (default: Arstacity/finbert-finetuned from HuggingFace)'
     )
     
     args = parser.parse_args()

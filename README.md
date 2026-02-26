@@ -102,6 +102,31 @@
    # Edit .env with your API credentials
    ```
 
+5. **FinBERT Model Setup**
+
+   The pipeline uses a fine-tuned FinBERT model hosted on HuggingFace Hub.
+   
+   **Default (Automatic Download):**
+   ```bash
+   # The model downloads automatically on first run - no action needed!
+   # Using: Arstacity/finbert-finetuned (~400MB)
+   python tests/test.py --stages 1B
+   ```
+   
+   **Alternative - Use Base Model:**
+   ```bash
+   # Use ProsusAI's base FinBERT instead (also auto-downloads)
+   python tests/test.py --finbert-model ProsusAI/finbert --stages 1B
+   ```
+
+   **For Training Your Own:**
+   ```bash
+   # See src/fintrain.py for fine-tuning on custom data
+   python src/fintrain.py
+   ```
+
+   > 💡 **Note:** Fine-tuned model ([Arstacity/finbert-finetuned](https://huggingface.co/Arstacity/finbert-finetuned)) is trained on financial text and optimized for market sentiment analysis.
+
 ### Running the Application
 
 #### Option 1: Automated Start (Windows)
@@ -235,8 +260,9 @@ python test.py --stages 2A 2B 2C
 # Full pipeline with specific tickers
 python test.py --ticker AAPL TSLA GME --stages 1A 1B 1C 2A 2B 2C 3
 
-# Use fine-tuned FinBERT
-python test.py --finetuned --stages 1B
+# Pipeline uses Arstacity/finbert-finetuned by default
+# To use base model instead:
+python test.py --finbert-model ProsusAI/finbert --stages 1B
 ```
 
 ## 🎯 Model Performance
@@ -276,7 +302,8 @@ This project is for educational and research purposes only. It is not financial 
 
 ## 🙏 Acknowledgments
 
-- FinBERT model by ProsusAI
+- Fine-tuned FinBERT model: [Arstacity/finbert-finetuned](https://huggingface.co/Arstacity/finbert-finetuned)
+- Base FinBERT model by ProsusAI
 - TA-Lib for technical analysis
 - PRAW for Reddit API access
 - The open-source ML community
