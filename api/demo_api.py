@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import subprocess
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Dict, List
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -47,27 +49,41 @@ async def _run_pipeline(job: DemoJob) -> None:
 
     cmd = [PYTHON_EXE, str(TEST_SCRIPT), "--stages", *job.stages]
 
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        cwd=str(PROJECT_ROOT),
-    )
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            cwd=str(PROJECT_ROOT),
+        )
 
-    if process.stdout:
-        async for line in process.stdout:
-            decoded = line.decode("utf-8", errors="ignore").rstrip()
-            if decoded:
-                job.logs.append(decoded)
+        # Read logs line by line
+        for line in process.stdout:
+            line = line.strip()
+            if line:
+                job.logs.append(line)
 
-    await process.wait()
-    job.exit_code = process.returncode
-    job.ended_at = datetime.now(timezone.utc).isoformat()
-    job.status = "completed" if process.returncode == 0 else "failed"
+        process.wait()
+
+        job.exit_code = process.returncode
+        job.ended_at = datetime.now(timezone.utc).isoformat()
+        job.status = "completed" if process.returncode == 0 else "failed"
+
+    except Exception as e:
+        job.logs.append(f"ERROR: {str(e)}")
+        job.status = "failed"
+        job.ended_at = datetime.now(timezone.utc).isoformat()
 
 
 app = FastAPI(title="Sentiment Demo API", version="1.0.0")
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/")
 def health() -> dict:

@@ -18,6 +18,7 @@ from collections import Counter
 from typing import Dict, List
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from api.tweet_api import _predict_v4_probability, _safe_float, get_finbert_engine
@@ -80,7 +81,13 @@ class CompanyScoreRequest(BaseModel):
 
 
 app = FastAPI(title="Company Scoring API", version="1.0.0")
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/")
 def health() -> dict:

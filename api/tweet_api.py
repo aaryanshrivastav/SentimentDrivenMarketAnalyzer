@@ -4,7 +4,6 @@ Tweet scoring API.
 Run directly:
   uvicorn api.tweet_api:app --host 0.0.0.0 --port 8011 --reload
 """
-
 from __future__ import annotations
 
 from functools import lru_cache
@@ -15,6 +14,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from src.model.lstm import ALL_FEATURES, build_interaction_features
@@ -43,6 +43,7 @@ SENTIMENT_FEATURES = [
     "sentiment_available",
     "sentiment_imputed",
 ]
+
 
 
 def _safe_float(value: float | int | np.floating | np.integer | None) -> float:
@@ -190,7 +191,13 @@ class TweetScoreRequest(BaseModel):
 
 
 app = FastAPI(title="Tweet Scoring API", version="1.0.0")
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/")
 def health() -> dict:
