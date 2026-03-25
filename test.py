@@ -32,12 +32,14 @@ USAGE:
 """
 
 import sys
+import os
 import logging
 import argparse
 import warnings
+import importlib
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Set
 
 import pandas as pd
 import numpy as np
@@ -46,7 +48,8 @@ import numpy as np
 # PATH SETUP
 # ══════════════════════════════════════════════════════════════════════════════
 
-PROJECT_ROOT = Path(__file__).parent
+THIS_FILE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = THIS_FILE_DIR if (THIS_FILE_DIR / "src").exists() else THIS_FILE_DIR.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "src" / "preprocessing"))
 
@@ -146,7 +149,7 @@ def run_stage_0(config: PipelineConfig) -> Dict[str, pd.DataFrame]:
     
     # ── Reddit Data ──────────────────────────────────────────────────────────
     try:
-        from reddit_collector import run_reddit_collection
+        from src.data_collection.reddit_collector import run_reddit_collection
         logger.info("Collecting Reddit data...")
         reddit_df = run_reddit_collection()
         if reddit_df is not None and len(reddit_df) > 0:
@@ -160,7 +163,8 @@ def run_stage_0(config: PipelineConfig) -> Dict[str, pd.DataFrame]:
     
     # ── StockTwits Data ──────────────────────────────────────────────────────
     try:
-        from stocktwits_collector import run_stocktwits_collection
+        stocktwits_module = importlib.import_module("src.data_collection.stocktwits_collector")
+        run_stocktwits_collection = stocktwits_module.run_stocktwits_collection
         logger.info("Collecting StockTwits data...")
         stocktwits_df = run_stocktwits_collection()
         if stocktwits_df is not None and len(stocktwits_df) > 0:
@@ -169,12 +173,14 @@ def run_stage_0(config: PipelineConfig) -> Dict[str, pd.DataFrame]:
             logger.info(f"StockTwits: {len(stocktwits_df)} messages collected")
         else:
             logger.warning("No StockTwits data collected")
+    except ModuleNotFoundError:
+        logger.warning("StockTwits collector not available; skipping this source")
     except Exception as e:
         logger.error(f"StockTwits collection failed: {e}")
     
     # ── News Data ────────────────────────────────────────────────────────────
     try:
-        from news_collector import run_news_collection
+        from src.data_collection.news_collector import run_news_collection
         logger.info("Collecting financial news...")
         news_df = run_news_collection()
         if news_df is not None and len(news_df) > 0:
@@ -188,16 +194,30 @@ def run_stage_0(config: PipelineConfig) -> Dict[str, pd.DataFrame]:
     
     # ── Market Data ──────────────────────────────────────────────────────────
     try:
-        from marketdata_collector import run_market_data_collection
+        from src.data_collection.marketdata_collector import run_market_data_collection
         logger.info(f"Collecting market data for {config.tickers}...")
         market_data = run_market_data_collection(tickers=config.tickers)
-        if market_data and 'prices' in market_data:
+        if market_data and len(market_data) > 0:
             results['market'] = market_data
             logger.info(f"Market: Data collected for {len(config.tickers)} tickers")
         else:
             logger.warning("No market data collected")
     except Exception as e:
         logger.error(f"Market collection failed: {e}")
+    
+    # ── Kaggle & HuggingFace Data ────────────────────────────────────────────
+    try:
+        from src.data_collection.kaggle_hf_collector import run_kaggle_hf_collection
+        logger.info("Collecting Kaggle & HuggingFace data...")
+        kaggle_hf_df = run_kaggle_hf_collection()
+        if kaggle_hf_df is not None and len(kaggle_hf_df) > 0:
+            kaggle_hf_df['source'] = 'kaggle_hf'
+            results['kaggle_hf'] = kaggle_hf_df
+            logger.info(f"Kaggle & HuggingFace: {len(kaggle_hf_df)} records collected")
+        else:
+            logger.warning("No Kaggle & HuggingFace data collected")
+    except Exception as e:
+        logger.error(f"Kaggle & HuggingFace collection failed: {e}")
     
     # ── Save raw data ────────────────────────────────────────────────────────
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -226,6 +246,10 @@ def run_stage_1a(config: PipelineConfig, raw_data: Optional[Dict] = None) -> pd.
       4. Named Entity Recognition (NER) → ticker linking
       5. User credibility scoring
     
+    Source-aware processing:
+      - Live social (Reddit, StockTwits): Strict filtering (bot patterns, frequency)
+      - Static datasets (Kaggle, HuggingFace): Lenient filtering (pre-curated)
+    
     Critical improvements:
       - Only process posts with 5+ upvotes (signal quality)
       - Only keep posts with 10+ words (too short = noise)
@@ -249,6 +273,10 @@ def run_stage_1a(config: PipelineConfig, raw_data: Optional[Dict] = None) -> pd.
         
         reddit_files = sorted(glob.glob(str(config.processed_dir / "reddit_raw_*.csv")))
         news_files = sorted(glob.glob(str(config.processed_dir / "news_raw_*.csv")))
+        # Kaggle & HuggingFace saves to data/raw/ (check both locations)
+        kaggle_hf_files = sorted(glob.glob(str(config.data_dir / "raw" / "kaggle_hf_raw_*.csv")))
+        if not kaggle_hf_files:
+            kaggle_hf_files = sorted(glob.glob(str(config.processed_dir / "kaggle_hf_raw_*.csv")))
         
         frames = []
         if reddit_files:
@@ -263,6 +291,21 @@ def run_stage_1a(config: PipelineConfig, raw_data: Optional[Dict] = None) -> pd.
             frames.append(df)
             logger.info(f"Loaded News: {len(df)} articles")
         
+        if kaggle_hf_files:
+            df = pd.read_csv(kaggle_hf_files[-1])
+            # Preserve per-row source labels from collector
+            # (kaggle, kaggle_india_stocktwits, huggingface, etc.)
+            if 'source' not in df.columns:
+                df['source'] = 'kaggle_hf'
+            
+            # Log source distribution in kaggle_hf data
+            source_counts = df['source'].value_counts()
+            logger.info(f"Loaded Kaggle & HuggingFace: {len(df)} records")
+            for src, count in source_counts.items():
+                logger.info(f"  - {src}: {count}")
+            
+            frames.append(df)
+        
         if not frames:
             raise FileNotFoundError("No raw social data found. Run Stage 0 first.")
         
@@ -270,7 +313,7 @@ def run_stage_1a(config: PipelineConfig, raw_data: Optional[Dict] = None) -> pd.
     else:
         # Combine from raw_data dict
         frames = []
-        for key in ['reddit', 'stocktwits', 'news']:
+        for key in ['reddit', 'stocktwits', 'news', 'kaggle_hf']:
             if key in raw_data and isinstance(raw_data[key], pd.DataFrame):
                 frames.append(raw_data[key])
         
@@ -280,11 +323,51 @@ def run_stage_1a(config: PipelineConfig, raw_data: Optional[Dict] = None) -> pd.
         df = pd.concat(frames, ignore_index=True)
     
     logger.info(f"Total raw posts: {len(df)}")
+    logger.info(f"Source distribution: {df['source'].value_counts().to_dict()}")
+    
+    # ── Normalize critical columns (handle source-specific naming) ──────────
+    # Some sources (Kaggle/HF) may have different column names
+    logger.info("Normalizing input schema across all sources...")
+    
+    # Ensure text column
+    for text_alias in ["clean_text", "tweet", "Tweet", "content", "body", "message"]:
+        if text_alias in df.columns and "text" not in df.columns:
+            df["text"] = df[text_alias]
+            break
+    if "text" not in df.columns:
+        df["text"] = ""
+    
+    # Ensure author/user column
+    for author_alias in ["user", "username", "author_name", "screen_name", "handle"]:
+        if author_alias in df.columns and "author" not in df.columns:
+            df["author"] = df[author_alias]
+            break
+    if "author" not in df.columns:
+        df["author"] = "[unknown]"
+    
+    # Ensure timestamp column
+    for ts_alias in ["created_utc", "timestamp", "created_at", "datetime", "date", "Date"]:
+        if ts_alias in df.columns and "timestamp_utc" not in df.columns:
+            df["timestamp_utc"] = df[ts_alias]
+            break
+    if "timestamp_utc" not in df.columns:
+        df["timestamp_utc"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Ensure upvotes/likes column (important for spam filtering)
+    if "upvotes" not in df.columns:
+        for upvote_alias in ["likes", "like_count", "favorite_count", "favorites", "votes"]:
+            if upvote_alias in df.columns:
+                df["upvotes"] = df[upvote_alias]
+                break
+    if "upvotes" not in df.columns:
+        df["upvotes"] = None  # Will be handled by spam filter
+    
+    logger.info("Schema normalization complete")
     
     # ── Step 1: Bot Detection ────────────────────────────────────────────────
     try:
-        from preprocessing.bot_detection import BotDetection
-        logger.info("Running bot detection...")
+        from src.preprocessing.bot_detection import BotDetection
+        logger.info("Running bot detection (source-aware)...")
         bot_detector = BotDetection(df)
         df = bot_detector.run()
         logger.info(f"After bot removal: {len(df)} posts")
@@ -293,8 +376,8 @@ def run_stage_1a(config: PipelineConfig, raw_data: Optional[Dict] = None) -> pd.
     
     # ── Step 2: Spam & Low-Quality Filtering ─────────────────────────────────
     try:
-        from preprocessing.spam_filter import SpamFilter
-        logger.info("Running spam filter...")
+        from src.preprocessing.spam_filter import SpamFilter
+        logger.info("Running spam filter (source-aware, lenient for Kaggle/HF)...")
         spam_filter = SpamFilter(df)
         df = spam_filter.run()
         logger.info(f"After spam removal: {len(df)} posts")
@@ -303,8 +386,8 @@ def run_stage_1a(config: PipelineConfig, raw_data: Optional[Dict] = None) -> pd.
     
     # ── Step 3: Sarcasm Detection ────────────────────────────────────────────
     try:
-        from preprocessing.sarcasm_detection import SarcasmDetection
-        logger.info("Running sarcasm detection (RoBERTa)...")
+        from src.preprocessing.sarcasm_detection import SarcasmDetection
+        logger.info("Running sarcasm detection (RoBERTa, source-aware)...")
         sarcasm_detector = SarcasmDetection(df)
         df = sarcasm_detector.run()
         
@@ -333,7 +416,7 @@ def run_stage_1a(config: PipelineConfig, raw_data: Optional[Dict] = None) -> pd.
     
     # ── Step 4: Named Entity Recognition (NER) → Ticker Linking ─────────────
     try:
-        from preprocessing.ner_linking import NERLinking
+        from src.preprocessing.ner_linking import NERLinking
         logger.info("Running NER ticker linking (SpaCy)...")
         ner_linker = NERLinking(df)
         df = ner_linker.run()
@@ -352,7 +435,7 @@ def run_stage_1a(config: PipelineConfig, raw_data: Optional[Dict] = None) -> pd.
     
     # ── Step 5: User Credibility Scoring ─────────────────────────────────────
     try:
-        from preprocessing.credibility_scoring import CredibilityScoring
+        from src.preprocessing.credibility_scoring import CredibilityScoring
         logger.info("Computing user credibility scores...")
         scorer = CredibilityScoring(df)
         df = scorer.run()
@@ -361,7 +444,8 @@ def run_stage_1a(config: PipelineConfig, raw_data: Optional[Dict] = None) -> pd.
         if 'final_weight' in df.columns and 'user_credibility' not in df.columns:
             df['user_credibility'] = df['final_weight']
         
-        logger.info(f"Credibility scoring complete (range: {df['user_credibility'].min():.2f} - {df['user_credibility'].max():.2f})")
+        if 'user_credibility' in df.columns:
+            logger.info(f"Credibility scoring complete (range: {df['user_credibility'].min():.2f} - {df['user_credibility'].max():.2f})")
     except Exception as e:
         logger.warning(f"Credibility scoring failed: {e}. Using default scores.")
         df['user_credibility'] = 1.0
@@ -370,6 +454,20 @@ def run_stage_1a(config: PipelineConfig, raw_data: Optional[Dict] = None) -> pd.
     if 'sarcasm_flag' in df.columns:
         # Downweight uncertain posts by 50%
         df.loc[df['sarcasm_flag'] == 'uncertain', 'user_credibility'] *= 0.5
+    
+    # ── Final validation: ensure required columns exist ─────────────────────
+    required_cols = ['text', 'ticker', 'timestamp_utc', 'source', 'sarcasm_score', 'sarcasm_flag', 'user_credibility']
+    for col in required_cols:
+        if col not in df.columns:
+            logger.warning(f"Missing required column '{col}' after Stage 1A, filling with defaults")
+            if col == 'sarcasm_score':
+                df[col] = 0.0
+            elif col == 'sarcasm_flag':
+                df[col] = 'normal'
+            elif col == 'user_credibility':
+                df[col] = 1.0
+            else:
+                df[col] = None
     
     # ── Save cleaned data ────────────────────────────────────────────────────
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -421,7 +519,7 @@ def run_stage_1b(df: pd.DataFrame, config: PipelineConfig) -> pd.DataFrame:
     output_csv = config.processed_dir / "stage1b_sentiment.csv"
     
     try:
-        from finbert import FinBERTEngine, run_finbert_stage
+        from src.sentiment.finbert import FinBERTEngine, run_finbert_stage
         
         logger.info(f"Loading FinBERT model: {config.finbert_model}")
         finbert = FinBERTEngine(model_name=config.finbert_model)
@@ -432,6 +530,11 @@ def run_stage_1b(df: pd.DataFrame, config: PipelineConfig) -> pd.DataFrame:
             df['clean_text'] = df['text']
         if 'user_credibility' not in df.columns:
             df['user_credibility'] = 1.0
+
+        # Preserve incoming labels (if any) for future train/test routing.
+        if 'sentiment_label' in df.columns and 'original_sentiment_label' not in df.columns:
+            df['original_sentiment_label'] = df['sentiment_label']
+            df['original_label_available'] = df['original_sentiment_label'].notna()
         
         # Run inference on DataFrame
         df = run_finbert_stage(
@@ -542,7 +645,7 @@ def run_stage_1c(df: pd.DataFrame, config: PipelineConfig) -> pd.DataFrame:
     
     # ── Run aggregation ──────────────────────────────────────────────────────
     try:
-        from analyser import aggregate_sentiment_features
+        from src.analyser import aggregate_sentiment_features
         
         logger.info(f"Aggregating sentiment features (window={config.window_freq}, lag={config.lag_windows})...")
         features_df = aggregate_sentiment_features(
@@ -593,13 +696,37 @@ def run_stage_2a(config: PipelineConfig) -> pd.DataFrame:
     logger.info("="*80)
     
     try:
-        from feature import build_feature_matrix
-        
+        from src.sentiment.feature import build_feature_matrix
+        from src.data_collection.marketdata_collector import run_market_data_collection
+
+        target_tickers = getattr(config, "market_tickers", None) or config.tickers
+
+        def _to_yf_symbol(t: str) -> str:
+            t = str(t).strip().upper()
+            if t.endswith("_NS"):
+                return t.replace("_NS", ".NS")
+            if t.endswith("_BO"):
+                return t.replace("_BO", ".BO")
+            return t
+
+        yf_tickers = sorted({_to_yf_symbol(t) for t in target_tickers if str(t).strip()})
+        logger.info("Collecting market data for dynamic tickers: %s", yf_tickers)
+        run_market_data_collection(tickers=yf_tickers)
+
         logger.info("Building market feature matrix...")
         feature_matrix = build_feature_matrix(
             sentiment_features=None,  # Market features only; sentiment added in Stage 2C
-            data_dir=config.market_dir  # Directory containing market data CSVs
+            data_dir=config.market_dir,  # Directory containing market data CSVs
+            ticker_filter=yf_tickers,
         )
+
+        # Normalize back to pipeline ticker format expected by sentiment stages.
+        if "ticker" in feature_matrix.columns:
+            feature_matrix["ticker"] = (
+                feature_matrix["ticker"].astype(str)
+                .str.replace(".NS", "_NS", regex=False)
+                .str.replace(".BO", "_BO", regex=False)
+            )
         
         logger.info(f"Feature matrix built: {feature_matrix.shape}")
         
@@ -625,6 +752,37 @@ def run_stage_2a(config: PipelineConfig) -> pd.DataFrame:
     return feature_matrix
 
 
+def _derive_market_tickers(stage_data: Dict[str, Any], config: PipelineConfig) -> List[str]:
+    """Derive ticker universe from earlier sentiment stages; fallback to config tickers."""
+    candidate_sources = [
+        stage_data.get("1C"),
+        stage_data.get("1B"),
+        stage_data.get("1A"),
+    ]
+
+    derived: Set[str] = set()
+    for df in candidate_sources:
+        if isinstance(df, pd.DataFrame) and "ticker" in df.columns:
+            vals = (
+                df["ticker"]
+                .dropna()
+                .astype(str)
+                .str.strip()
+                .str.upper()
+            )
+            derived.update(v for v in vals if v and v not in {"NONE", "NAN", "NULL"})
+            if derived:
+                break
+
+    if not derived:
+        logger.warning("No tickers derived from Stage 1 outputs; falling back to config.tickers")
+        return list(config.tickers)
+
+    ordered = sorted(derived)
+    logger.info("Derived %d market tickers from Stage 1 outputs: %s", len(ordered), ordered)
+    return ordered
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # STAGE 2B: GRANGER CAUSALITY TEST
 # ══════════════════════════════════════════════════════════════════════════════
@@ -645,9 +803,97 @@ def run_stage_2b(
     logger.info("\n" + "="*80)
     logger.info("STAGE 2B: GRANGER CAUSALITY TEST")
     logger.info("="*80)
+
+    # Granger alignment controls (env-overridable)
+    # GRANGER_RELAXED_ALIGNMENT=1 enables resample+fill alignment instead of strict timestamp intersection.
+    # GRANGER_SENTIMENT_FILL supports: ffill (default) or zero.
+    use_relaxed_alignment = os.getenv("GRANGER_RELAXED_ALIGNMENT", "1") == "1"
+    sentiment_fill_mode = os.getenv("GRANGER_SENTIMENT_FILL", "ffill").strip().lower()
+    if sentiment_fill_mode not in {"ffill", "zero"}:
+        sentiment_fill_mode = "ffill"
+
+    def _align_series(
+        sent_sub: pd.DataFrame,
+        price_sub: pd.DataFrame,
+        freq: str,
+    ) -> tuple[pd.Series, pd.Series]:
+        """Resample and align price/sentiment to a common time grid."""
+        sent_ts = (
+            sent_sub.set_index("timestamp_utc")["avg_sentiment"]
+            .resample(freq)
+            .mean()
+        )
+        price_ts = (
+            price_sub.set_index("timestamp_utc")["Close"]
+            .resample(freq)
+            .last()
+        )
+
+        merged = pd.concat([
+            price_ts.rename("price"),
+            sent_ts.rename("sentiment"),
+        ], axis=1)
+
+        # Price must exist; sentiment can be forward-filled (or zero-filled) in relaxed mode.
+        merged = merged.dropna(subset=["price"])
+        if use_relaxed_alignment:
+            if sentiment_fill_mode == "zero":
+                merged["sentiment"] = merged["sentiment"].fillna(0.0)
+            else:
+                merged["sentiment"] = merged["sentiment"].ffill().fillna(0.0)
+
+        merged = merged.dropna(subset=["sentiment"])
+        return merged["price"], merged["sentiment"]
+
+    def _to_yf_symbol(ticker: str) -> str:
+        t = str(ticker).strip().upper()
+        if t.endswith("_NS"):
+            return t.replace("_NS", ".NS")
+        if t.endswith("_BO"):
+            return t.replace("_BO", ".BO")
+        return t
+
+    def _backfill_price_from_yfinance(sent_sub: pd.DataFrame, ticker: str) -> pd.Series:
+        """Fetch additional DAILY close history around sentiment range for sparse-overlap tickers."""
+        try:
+            yf = importlib.import_module("yfinance")
+        except Exception as exc:
+            logger.warning("yfinance unavailable for backfill (%s): %s", ticker, exc)
+            return pd.Series(dtype=float)
+
+        if sent_sub.empty or "timestamp_utc" not in sent_sub.columns:
+            return pd.Series(dtype=float)
+
+        sent_min = pd.to_datetime(sent_sub["timestamp_utc"], utc=True).min()
+        sent_max = pd.to_datetime(sent_sub["timestamp_utc"], utc=True).max()
+        if pd.isna(sent_min) or pd.isna(sent_max):
+            return pd.Series(dtype=float)
+
+        start = (sent_min - pd.Timedelta(days=30)).date().isoformat()
+        end = (sent_max + pd.Timedelta(days=2)).date().isoformat()
+        yf_symbol = _to_yf_symbol(ticker)
+
+        try:
+            hist = yf.Ticker(yf_symbol).history(start=start, end=end, interval="1d", auto_adjust=True)
+            if hist.empty or "Close" not in hist.columns:
+                return pd.Series(dtype=float)
+
+            idx = pd.to_datetime(hist.index, utc=True)
+            price_series = pd.Series(hist["Close"].values, index=idx, name="price")
+            logger.info(
+                "%s: backfilled %d daily price points from yfinance (%s to %s)",
+                ticker,
+                len(price_series),
+                start,
+                end,
+            )
+            return price_series
+        except Exception as exc:
+            logger.warning("%s: yfinance backfill failed: %s", ticker, exc)
+            return pd.Series(dtype=float)
     
     try:
-        from granger_test import run_granger_batch
+        from src.market.granger_test import run_granger_batch
         
         # ── Prepare data for Granger test ────────────────────────────────────
         logger.info("Preparing data for Granger causality test...")
@@ -679,25 +925,64 @@ def run_stage_2b(
                 logger.warning(f"No Close column for {ticker}, skipping")
                 continue
             
-            # Align on common timestamps
-            common_times = set(sent_sub['timestamp_utc']) & set(price_sub['timestamp_utc'])
-            
-            # Relax requirement if we have limited data
-            min_required = min(30, max(10, len(common_times)))
-            if len(common_times) < 10:  # Absolute minimum for any statistical test
-                logger.warning(f"Insufficient overlapping data for {ticker} ({len(common_times)} points), skipping")
+            # Align series with robust resampling (hourly first, daily fallback)
+            price_series_h, sent_series_h = _align_series(sent_sub, price_sub, freq="1h")
+            n_hourly = len(price_series_h)
+
+            if n_hourly >= 24:
+                ticker_data[ticker] = (price_series_h, sent_series_h)
+                logger.info(f"  {ticker}: {n_hourly} aligned hourly points")
                 continue
-            elif len(common_times) < 30:
-                logger.warning(f"{ticker}: Only {len(common_times)} overlapping points (recommended: 30+), results may be unreliable")
-            
-            common_times = sorted(common_times)
-            
-            # Extract aligned series
-            sent_series = sent_sub.set_index('timestamp_utc').loc[common_times, 'avg_sentiment']
-            price_series = price_sub.set_index('timestamp_utc').loc[common_times, 'Close']
-            
-            ticker_data[ticker] = (price_series, sent_series)
-            logger.info(f"  {ticker}: {len(common_times)} aligned time points")
+
+            # Fallback to daily if hourly data is too sparse for lag-based testing.
+            price_series_d, sent_series_d = _align_series(sent_sub, price_sub, freq="1D")
+            n_daily = len(price_series_d)
+
+            if n_daily >= 10:
+                ticker_data[ticker] = (price_series_d, sent_series_d)
+                logger.warning(
+                    "%s: hourly overlap too small (%d). Using daily alignment (%d points).",
+                    ticker,
+                    n_hourly,
+                    n_daily,
+                )
+            else:
+                # Try backfilling additional DAILY price history from yfinance for old sentiment ranges.
+                backfill_price = _backfill_price_from_yfinance(sent_sub, ticker)
+                if not backfill_price.empty:
+                    sent_daily = (
+                        sent_sub.set_index("timestamp_utc")["avg_sentiment"]
+                        .resample("1D")
+                        .mean()
+                    )
+                    merged_b = pd.concat([
+                        backfill_price.rename("price"),
+                        sent_daily.rename("sentiment"),
+                    ], axis=1)
+                    merged_b = merged_b.dropna(subset=["price"])
+
+                    # IMPORTANT: We do not alter original labels; this fill is only for Granger series alignment.
+                    if sentiment_fill_mode == "zero":
+                        merged_b["sentiment"] = merged_b["sentiment"].fillna(0.0)
+                    else:
+                        merged_b["sentiment"] = merged_b["sentiment"].ffill().fillna(0.0)
+
+                    merged_b = merged_b.dropna(subset=["sentiment"])
+                    if len(merged_b) >= 10:
+                        ticker_data[ticker] = (merged_b["price"], merged_b["sentiment"])
+                        logger.warning(
+                            "%s: used yfinance backfill for Granger (daily points=%d)",
+                            ticker,
+                            len(merged_b),
+                        )
+                        continue
+
+                logger.warning(
+                    "Insufficient aligned data for %s (hourly=%d, daily=%d), skipping",
+                    ticker,
+                    n_hourly,
+                    n_daily,
+                )
         
         if not ticker_data:
             logger.warning("No tickers with sufficient overlapping sentiment + price data for Granger test")
@@ -709,7 +994,7 @@ def run_stage_2b(
             logger.info(f"Running Granger causality test (max lag={config.granger_max_lag})...")
             granger_results = run_granger_batch(
                 ticker_data=ticker_data,
-                max_lag=config.granger_max_lag
+                max_lags=config.granger_max_lag
             )
             
             logger.info(f"Granger test complete: {len(granger_results)} results")
@@ -731,16 +1016,38 @@ def run_stage_2b(
             logger.warning("Stage 2B is optional - you can proceed with Stage 2C/3/3A")
             logger.warning("="*80)
         else:
-            significant = granger_results[granger_results['p_value'] < config.granger_significance]
+            # Support both legacy per-lag schema and current batch summary schema.
+            if "p_value" in granger_results.columns:
+                sig_mask = granger_results["p_value"] < config.granger_significance
+                p_col = "p_value"
+                lag_col = "lag" if "lag" in granger_results.columns else None
+            else:
+                p_col = "min_p_value" if "min_p_value" in granger_results.columns else None
+                lag_col = "best_lag" if "best_lag" in granger_results.columns else None
+                sig_mask = (granger_results[p_col] < config.granger_significance) if p_col else pd.Series([False] * len(granger_results), index=granger_results.index)
+
+            significant = granger_results[sig_mask]
+
+            # Ensure ticker is available as a printable column even when it is the DataFrame index.
+            printable = granger_results.reset_index() if "ticker" not in granger_results.columns and (granger_results.index.name == "ticker" or "ticker" not in granger_results.columns) else granger_results
+            printable_sig = significant.reset_index() if "ticker" not in significant.columns and (significant.index.name == "ticker" or "ticker" not in significant.columns) else significant
             
             logger.info(f"\nGranger Causality Results:")
-            logger.info(f"  Total tests: {len(granger_results)}")
+            logger.info(f"  Total tests: {len(printable)}")
             logger.info(f"  Significant (p<{config.granger_significance}): {len(significant)}")
             
             if len(significant) > 0:
                 logger.info(f"\nStocks where sentiment LEADS price:")
-                for _, row in significant.iterrows():
-                    logger.info(f"  {row['ticker']}: lag={row['lag']}, p={row['p_value']:.4f}")
+                for _, row in printable_sig.iterrows():
+                    tkr = row.get("ticker", "[unknown]")
+                    pval = row.get(p_col, None) if p_col else None
+                    lagv = row.get(lag_col, None) if lag_col else None
+                    if pval is None:
+                        logger.info(f"  {tkr}: significant")
+                    elif lagv is None:
+                        logger.info(f"  {tkr}: p={float(pval):.4f}")
+                    else:
+                        logger.info(f"  {tkr}: lag={lagv}, p={float(pval):.4f}")
             else:
                 logger.warning("No significant Granger causality found for any stock!")
     
@@ -778,8 +1085,8 @@ def run_stage_2c(
     logger.info("="*80)
     
     try:
-        from analyser import join_to_price
-        from lstm import build_interaction_features
+        from src.analyser import join_to_price
+        from src.model.lstm import build_interaction_features
         
         # ── Fuse sentiment + market features ─────────────────────────────────
         logger.info("Fusing sentiment and market features...")
@@ -793,7 +1100,7 @@ def run_stage_2c(
             features_df=sentiment_df,
             price_time_col='timestamp_utc',
             price_ticker_col='ticker',
-            fill_missing='zero'  # Fill missing sentiment with 0
+            fill_missing='ffill'  # Preserve sentiment continuity; avoid overwhelming zero-imputation noise
         )
         
         logger.info(f"Features fused: {fused.shape}")
@@ -840,8 +1147,8 @@ def run_stage_3(fused_df: pd.DataFrame, config: PipelineConfig) -> Dict[str, Any
     logger.info("="*80)
     
     try:
-        from lstm import run_stage3
-        from feature import time_split, add_target
+        from src.model.lstm import run_stage3
+        from src.sentiment.feature import time_split, add_target
         
         # ── Add target variable ──────────────────────────────────────────────
         if 'target' not in fused_df.columns and 'direction' not in fused_df.columns:
@@ -918,8 +1225,8 @@ def run_stage_3a(fused_df: pd.DataFrame, config: PipelineConfig) -> pd.DataFrame
     logger.info("="*80)
     
     try:
-        from lstm import run_ablation
-        from feature import time_split, add_target
+        from src.model.lstm import run_ablation
+        from src.sentiment.feature import time_split, add_target
         
         # ── Add target variable ──────────────────────────────────────────────
         if 'target' not in fused_df.columns and 'direction' not in fused_df.columns:
@@ -976,6 +1283,49 @@ def run_stage_3a(fused_df: pd.DataFrame, config: PipelineConfig) -> pd.DataFrame
     return ablation_results
 
 
+def log_stage_output(stage: str, data: Any, config: PipelineConfig) -> None:
+    """Log a compact summary of output produced by a stage."""
+    logger.info(f"\n[Stage {stage}] Output summary")
+
+    if data is None:
+        logger.info("  Type: None")
+        return
+
+    if isinstance(data, pd.DataFrame):
+        logger.info(f"  Type: DataFrame")
+        logger.info(f"  Shape: {data.shape[0]} rows x {data.shape[1]} columns")
+        preview_cols = list(data.columns[:8])
+        suffix = " ..." if len(data.columns) > 8 else ""
+        logger.info(f"  Columns: {preview_cols}{suffix}")
+
+        for col in ["timestamp_utc", "ticker", "source"]:
+            if col in data.columns:
+                non_null = int(data[col].notna().sum())
+                logger.info(f"  Non-null {col}: {non_null}")
+        return
+
+    if isinstance(data, dict):
+        logger.info(f"  Type: dict ({len(data)} keys)")
+        logger.info(f"  Keys: {list(data.keys())}")
+        for key, value in data.items():
+            if isinstance(value, pd.DataFrame):
+                logger.info(f"    - {key}: DataFrame {value.shape[0]}x{value.shape[1]}")
+            elif isinstance(value, dict):
+                logger.info(f"    - {key}: dict ({len(value)} keys)")
+            elif isinstance(value, list):
+                logger.info(f"    - {key}: list ({len(value)} items)")
+            else:
+                logger.info(f"    - {key}: {type(value).__name__}")
+        return
+
+    if isinstance(data, list):
+        logger.info(f"  Type: list ({len(data)} items)")
+        return
+
+    logger.info(f"  Type: {type(data).__name__}")
+    logger.info(f"  Value preview: {str(data)[:200]}")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN PIPELINE ORCHESTRATOR
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1006,16 +1356,19 @@ def run_pipeline(stages: List[str], config: PipelineConfig) -> Dict[str, Any]:
         # ── Stage 0: Raw Data Collection ────────────────────────────────────
         if '0' in stages:
             stage_data['0'] = run_stage_0(config)
+            log_stage_output('0', stage_data['0'], config)
         
         # ── Stage 1A: Data Cleaning ──────────────────────────────────────────
         if '1A' in stages:
             raw_data = stage_data.get('0', None)
             stage_data['1A'] = run_stage_1a(config, raw_data)
+            log_stage_output('1A', stage_data['1A'], config)
         elif any(s in stages for s in ['1B', '1C', '2B', '2C', '3', '3A']):
             # Auto-load 1A if needed by downstream stages
             logger.info("Stage 1A not requested but needed downstream, attempting to load from disk...")
             try:
                 stage_data['1A'] = run_stage_1a(config, None)
+                log_stage_output('1A', stage_data['1A'], config)
             except FileNotFoundError:
                 logger.warning("No cleaned data found. Run Stage 1A first or provide raw data.")
         
@@ -1024,6 +1377,7 @@ def run_pipeline(stages: List[str], config: PipelineConfig) -> Dict[str, Any]:
             if '1A' not in stage_data:
                 raise ValueError("Stage 1B requires Stage 1A data")
             stage_data['1B'] = run_stage_1b(stage_data['1A'], config)
+            log_stage_output('1B', stage_data['1B'], config)
         elif any(s in stages for s in ['1C', '2B', '2C', '3', '3A']):
             # Try to load from disk
             import glob
@@ -1031,46 +1385,68 @@ def run_pipeline(stages: List[str], config: PipelineConfig) -> Dict[str, Any]:
             if sentiment_files:
                 logger.info(f"Loading Stage 1B from disk: {sentiment_files[-1]}")
                 stage_data['1B'] = pd.read_csv(sentiment_files[-1])
+                log_stage_output('1B', stage_data['1B'], config)
             elif '1A' in stage_data:
                 logger.info("Stage 1B not requested but needed, running now...")
                 stage_data['1B'] = run_stage_1b(stage_data['1A'], config)
+                log_stage_output('1B', stage_data['1B'], config)
         
         # ── Stage 1C: Sentiment Aggregation ──────────────────────────────────
         if '1C' in stages:
             if '1B' not in stage_data:
                 raise ValueError("Stage 1C requires Stage 1B data")
             stage_data['1C'] = run_stage_1c(stage_data['1B'], config)
+            log_stage_output('1C', stage_data['1C'], config)
         elif any(s in stages for s in ['2B', '2C', '3', '3A']):
             # Try to load from disk
             features_file = config.output_dir / "sentiment_features.csv"
             if features_file.exists():
                 logger.info(f"Loading Stage 1C from disk: {features_file}")
                 stage_data['1C'] = pd.read_csv(features_file)
+                log_stage_output('1C', stage_data['1C'], config)
         
         # ── Stage 2A: Market Features ────────────────────────────────────────
         if '2A' in stages:
+            config.market_tickers = _derive_market_tickers(stage_data, config)
             stage_data['2A'] = run_stage_2a(config)
+            log_stage_output('2A', stage_data['2A'], config)
         elif any(s in stages for s in ['2B', '2C', '3', '3A']):
             # Try to load from disk
             market_file = config.output_dir / "market_features.csv"
             if market_file.exists():
                 logger.info(f"Loading Stage 2A from disk: {market_file}")
                 stage_data['2A'] = pd.read_csv(market_file)
+                if 'ticker' in stage_data['2A'].columns:
+                    target = set(_derive_market_tickers(stage_data, config))
+                    before = len(stage_data['2A'])
+                    stage_data['2A'] = stage_data['2A'][
+                        stage_data['2A']['ticker'].astype(str).str.upper().isin(target)
+                    ].copy()
+                    logger.info(
+                        "Filtered loaded Stage 2A by derived tickers: %d -> %d rows",
+                        before,
+                        len(stage_data['2A'])
+                    )
+                log_stage_output('2A', stage_data['2A'], config)
             else:
                 logger.info("Stage 2A not requested but needed, running now...")
+                config.market_tickers = _derive_market_tickers(stage_data, config)
                 stage_data['2A'] = run_stage_2a(config)
+                log_stage_output('2A', stage_data['2A'], config)
         
         # ── Stage 2B: Granger Causality ──────────────────────────────────────
         if '2B' in stages:
             if '1C' not in stage_data or '2A' not in stage_data:
                 raise ValueError("Stage 2B requires both Stage 1C and 2A data")
             stage_data['2B'] = run_stage_2b(stage_data['1C'], stage_data['2A'], config)
+            log_stage_output('2B', stage_data['2B'], config)
         
         # ── Stage 2C: Feature Fusion ─────────────────────────────────────────
         if '2C' in stages:
             if '1C' not in stage_data or '2A' not in stage_data:
                 raise ValueError("Stage 2C requires both Stage 1C and 2A data")
             stage_data['2C'] = run_stage_2c(stage_data['1C'], stage_data['2A'], config)
+            log_stage_output('2C', stage_data['2C'], config)
         elif any(s in stages for s in ['3', '3A']):
             # Try to load from disk
             fused_file = config.output_dir / "fused_features.csv"
@@ -1083,18 +1459,22 @@ def run_pipeline(stages: List[str], config: PipelineConfig) -> Dict[str, Any]:
                     logger.info("Fixing timestamp_utc column names from old merge...")
                     stage_data['2C'].rename(columns={'timestamp_utc_x': 'timestamp_utc'}, inplace=True)
                     stage_data['2C'].drop(columns=['timestamp_utc_y'], inplace=True, errors='ignore')
+
+                log_stage_output('2C', stage_data['2C'], config)
         
         # ── Stage 3: Model Training ──────────────────────────────────────────
         if '3' in stages:
             if '2C' not in stage_data:
                 raise ValueError("Stage 3 requires Stage 2C data (fused features)")
             stage_data['3'] = run_stage_3(stage_data['2C'], config)
+            log_stage_output('3', stage_data['3'], config)
         
         # ── Stage 3A: Ablation Study ─────────────────────────────────────────
         if '3A' in stages:
             if '2C' not in stage_data:
                 raise ValueError("Stage 3A requires Stage 2C data (fused features)")
             stage_data['3A'] = run_stage_3a(stage_data['2C'], config)
+            log_stage_output('3A', stage_data['3A'], config)
         
         # ── Pipeline Complete ────────────────────────────────────────────────
         logger.info("\n" + "="*80)

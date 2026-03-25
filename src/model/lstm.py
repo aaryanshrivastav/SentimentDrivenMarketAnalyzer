@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import logging
 import joblib
+import os
 from pathlib import Path
 from sklearn.metrics import accuracy_score, f1_score, classification_report
 from sklearn.preprocessing import StandardScaler
@@ -29,6 +30,38 @@ OUTPUT_DIR   = Path("models")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 
+def _lstm_checkpoint_path(name: str, input_size: int) -> Path:
+    """Checkpoint path scoped by input feature count to avoid shape-mismatch restores."""
+    return OUTPUT_DIR / f"{name}_best_in{input_size}.pt"
+
+
+def _read_threshold_env(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        v = float(raw)
+        if 0.0 < v < 1.0:
+            return v
+    except ValueError:
+        pass
+    logger.warning("Invalid %s='%s', using default %.3f", name, raw, default)
+    return default
+
+
+# Slightly narrower uncertain zone by default; configurable via env vars.
+UP_THRESH = _read_threshold_env("ENSEMBLE_UP_THRESH", 0.52)
+DOWN_THRESH = _read_threshold_env("ENSEMBLE_DOWN_THRESH", 0.48)
+if DOWN_THRESH >= UP_THRESH:
+    logger.warning(
+        "Invalid threshold pair (down=%.3f, up=%.3f); resetting to 0.48/0.52",
+        DOWN_THRESH,
+        UP_THRESH,
+    )
+    DOWN_THRESH = 0.48
+    UP_THRESH = 0.52
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # FEATURE GROUPS — used for ablation study
 # ─────────────────────────────────────────────────────────────────────────────
@@ -49,6 +82,7 @@ SENTIMENT_FEATURES = TECHNICAL_FEATURES + [
     "mention_volume", "weighted_volume", "sentiment_momentum",
     "sentiment_acceleration", "high_confidence_ratio",
     "pos_count", "neg_count", "neu_count",
+    "sentiment_available", "sentiment_imputed",
 ]
 
 # Version 4 — Full (+ events + interactions)
@@ -92,6 +126,70 @@ def get_available_features(df: pd.DataFrame, desired: list[str]) -> list[str]:
     return available
 
 
+def _apply_sentiment_quality_filter(
+    train: pd.DataFrame,
+    val: pd.DataFrame,
+    test: pd.DataFrame,
+    version: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Optionally filter to higher-confidence sentiment rows for sentiment-heavy variants."""
+    if version not in {"v3_sentiment", "v4_full"}:
+        return train, val, test
+
+    mode = os.getenv("ABLATION_SENTIMENT_FILTER", "available_only").strip().lower()
+    min_rows = int(os.getenv("ABLATION_MIN_ROWS", "200"))
+
+    if mode == "off":
+        return train, val, test
+
+    if "sentiment_available" not in train.columns:
+        logger.warning("sentiment_available not found; skipping sentiment-quality filtering for %s", version)
+        return train, val, test
+
+    def _mask(df: pd.DataFrame) -> pd.Series:
+        avail = df.get("sentiment_available", 0).fillna(0).astype(int) == 1
+        if mode == "available_only":
+            return avail
+        if mode == "available_or_not_imputed" and "sentiment_imputed" in df.columns:
+            not_imp = df["sentiment_imputed"].fillna(0).astype(int) == 0
+            return avail | not_imp
+        return avail
+
+    tr2 = train[_mask(train)].copy()
+    v2 = val[_mask(val)].copy()
+    te2 = test[_mask(test)].copy()
+
+    # Fallback if filtered slices become too small for stable training/testing.
+    if min(len(tr2), len(v2), len(te2)) < min_rows:
+        logger.warning(
+            "%s: sentiment-quality filter '%s' produced too few rows (train=%d, val=%d, test=%d). Using full split.",
+            version, mode, len(tr2), len(v2), len(te2)
+        )
+        return train, val, test
+
+    logger.info(
+        "%s: sentiment-quality filter '%s' applied (train %d->%d, val %d->%d, test %d->%d)",
+        version, mode, len(train), len(tr2), len(val), len(v2), len(test), len(te2)
+    )
+    return tr2, v2, te2
+
+
+def _best_threshold_from_val(y_true: np.ndarray, prob_up: np.ndarray) -> float:
+    """Pick threshold maximizing validation accuracy, then F1 as tie-breaker."""
+    best_t = 0.5
+    best_acc = -1.0
+    best_f1 = -1.0
+
+    for t in np.linspace(0.35, 0.65, 31):
+        preds = (prob_up >= t).astype(int)
+        acc = accuracy_score(y_true, preds)
+        f1 = f1_score(y_true, preds, average="weighted", zero_division=0)
+        if (acc > best_acc) or (acc == best_acc and f1 > best_f1):
+            best_acc, best_f1, best_t = acc, f1, float(t)
+
+    return best_t
+
+
 def prep_xy(df: pd.DataFrame, feature_cols: list[str]) -> tuple[np.ndarray, np.ndarray]:
     """Returns (X, y) as numpy arrays, dropping NaN and inf rows."""
     cols = feature_cols + ["target"]
@@ -126,9 +224,18 @@ def sharpe_ratio(returns: np.ndarray, periods_per_year: int = 8760) -> float:
 
 
 def evaluate(y_true, y_pred, prices=None, label="") -> dict:
+    if len(y_true) == 0 or len(y_pred) == 0:
+        logger.warning("%s evaluation skipped: empty y_true/y_pred after filtering.", label)
+        return {
+            "label": label,
+            "accuracy": float("nan"),
+            "f1_weighted": float("nan"),
+            "n_samples": 0,
+        }
+
     acc = accuracy_score(y_true, y_pred)
     f1  = f1_score(y_true, y_pred, average="weighted", zero_division=0)
-    result = {"label": label, "accuracy": acc, "f1_weighted": f1}
+    result = {"label": label, "accuracy": acc, "f1_weighted": f1, "n_samples": len(y_true)}
 
     if prices is not None:
         # Simulate: go long when predict=1, short when predict=0
@@ -142,7 +249,15 @@ def evaluate(y_true, y_pred, prices=None, label="") -> dict:
     logger.info(f"  F1       : {f1:.4f}")
     if "sharpe" in result:
         logger.info(f"  Sharpe   : {result['sharpe']:.4f}")
-    logger.info(classification_report(y_true, y_pred, target_names=["Down","Up"]))
+    logger.info(
+        classification_report(
+            y_true,
+            y_pred,
+            labels=[0, 1],
+            target_names=["Down", "Up"],
+            zero_division=0,
+        )
+    )
     return result
 
 
@@ -222,6 +337,7 @@ def train_lstm(
     name: str = "lstm",
 ) -> FinLSTM:
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    input_size = X_train.shape[1]
 
     # Build sequences
     Xs_tr, ys_tr = make_sequences(X_train, y_train, seq_len)
@@ -235,7 +351,7 @@ def train_lstm(
         torch.tensor(Xs_val), torch.tensor(ys_val)
     ), batch_size=batch_size * 2, shuffle=False)
 
-    model     = FinLSTM(input_size=X_train.shape[1]).to(device)
+    model     = FinLSTM(input_size=input_size).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss()
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3)
@@ -243,6 +359,7 @@ def train_lstm(
     best_val_loss = float("inf")
     patience_ctr  = 0
     PATIENCE      = 7
+    ckpt_path = _lstm_checkpoint_path(name=name, input_size=input_size)
 
     for epoch in range(1, epochs + 1):
         # Train
@@ -262,7 +379,7 @@ def train_lstm(
             for xb, yb in val_loader:
                 xb, yb = xb.to(device), yb.to(device)
                 val_losses.append(criterion(model(xb), yb).item())
-        val_loss = np.mean(val_losses)
+        val_loss = np.mean(val_losses) if len(val_losses) > 0 else float("inf")
         scheduler.step(val_loss)
 
         if epoch % 5 == 0:
@@ -271,7 +388,7 @@ def train_lstm(
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_ctr  = 0
-            torch.save(model.state_dict(), OUTPUT_DIR / f"{name}_best.pt")
+            torch.save(model.state_dict(), ckpt_path)
         else:
             patience_ctr += 1
             if patience_ctr >= PATIENCE:
@@ -279,7 +396,13 @@ def train_lstm(
                 break
 
     # Restore best weights
-    model.load_state_dict(torch.load(OUTPUT_DIR / f"{name}_best.pt"))
+    if ckpt_path.exists():
+        model.load_state_dict(torch.load(ckpt_path, map_location=device))
+    else:
+        logger.warning(
+            "LSTM checkpoint not found at %s. Returning last-epoch weights.",
+            ckpt_path,
+        )
     return model
 
 
@@ -389,14 +512,20 @@ def run_ablation(
         logger.info(f"  ABLATION: {version}")
         logger.info(f"{'='*50}")
 
-        feature_cols = get_available_features(train, desired_features)
+        tr_df, val_df, te_df = _apply_sentiment_quality_filter(train, val, test, version)
+
+        feature_cols = get_available_features(tr_df, desired_features)
         if not feature_cols:
             logger.warning(f"No features available for {version} - skipping.")
             continue
 
-        X_tr,  y_tr  = prep_xy(train, feature_cols)
-        X_val, y_val = prep_xy(val,   feature_cols)
-        X_te,  y_te  = prep_xy(test,  feature_cols)
+        X_tr,  y_tr  = prep_xy(tr_df, feature_cols)
+        X_val, y_val = prep_xy(val_df, feature_cols)
+        X_te,  y_te  = prep_xy(te_df, feature_cols)
+
+        if min(len(X_tr), len(X_val), len(X_te)) == 0:
+            logger.warning("%s: empty split after preprocessing; skipping.", version)
+            continue
 
         scaler  = StandardScaler().fit(X_tr)
         X_tr_s  = scaler.transform(X_tr)
@@ -404,13 +533,20 @@ def run_ablation(
         X_te_s  = scaler.transform(X_te)
 
         xgb_model = train_xgboost(X_tr_s, y_tr, X_val_s, y_val, name=version)
-        preds_val  = xgb_model.predict(X_val_s)
-        preds_test = xgb_model.predict(X_te_s)
+        val_prob  = xgb_model.predict_proba(X_val_s)[:, 1]
+        test_prob = xgb_model.predict_proba(X_te_s)[:, 1]
+
+        tuned_t = _best_threshold_from_val(y_val, val_prob)
+        logger.info("%s: tuned decision threshold=%.3f (from validation)", version, tuned_t)
+
+        preds_val  = (val_prob >= tuned_t).astype(int)
+        preds_test = (test_prob >= tuned_t).astype(int)
 
         val_result  = evaluate(y_val, preds_val,  label=f"{version} - Val")
         test_result = evaluate(y_te,  preds_test, label=f"{version} - Test")
         test_result["version"] = version
         test_result["n_features"] = len(feature_cols)
+        test_result["decision_threshold"] = tuned_t
         summary.append(test_result)
 
     summary_df = pd.DataFrame(summary).sort_values("accuracy", ascending=False)
@@ -466,15 +602,32 @@ def run_stage3(
     y_te_aligned = y_te[-len(ensemble_labels):]
     tradeable    = ensemble_labels != -1    # exclude Uncertain signals
 
-    logger.info(f"\nUncertain predictions (don't trade): "
+    logger.info(
+        "\nEnsemble thresholds: up=%.3f down=%.3f",
+        UP_THRESH,
+        DOWN_THRESH,
+    )
+    logger.info(f"Uncertain predictions (don't trade): "
                 f"{(ensemble_labels == -1).sum()}/{len(ensemble_labels)} "
                 f"({(ensemble_labels == -1).mean()*100:.1f}%)")
 
-    evaluate(
-        y_te_aligned[tradeable],
-        ensemble_labels[tradeable],
-        label="Ensemble (tradeable signals only)"
-    )
+    if tradeable.sum() == 0:
+        logger.warning(
+            "No tradeable ensemble signals under current thresholds. "
+            "Falling back to 0.5 cutoff for evaluation only."
+        )
+        fallback_labels = (final_prob >= 0.5).astype(int)
+        evaluate(
+            y_te_aligned,
+            fallback_labels,
+            label="Ensemble (fallback 0.5 cutoff)"
+        )
+    else:
+        evaluate(
+            y_te_aligned[tradeable],
+            ensemble_labels[tradeable],
+            label="Ensemble (tradeable signals only)"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

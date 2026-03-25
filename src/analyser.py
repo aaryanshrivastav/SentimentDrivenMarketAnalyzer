@@ -31,6 +31,7 @@ Usage:
 import numpy as np
 import pandas as pd
 import logging
+import os
 from pathlib import Path
 from typing import Optional, Union
 
@@ -297,16 +298,30 @@ def join_to_price(
     
     matched_count = merged['avg_sentiment'].notna().sum()
     missing_count = len(merged) - matched_count
+
+    # Track whether sentiment existed at the exact aligned timestamp before imputation.
+    merged['sentiment_available'] = merged['avg_sentiment'].notna().astype(int)
+    pre_fill_missing = merged['avg_sentiment'].isna()
     
     if fill_missing == "zero":
         merged[sentiment_cols] = merged[sentiment_cols].fillna(0)
+        merged['sentiment_imputed'] = pre_fill_missing.astype(int)
         logger.info(f"Filled {missing_count} rows with zero sentiment (no posts that hour)")
     elif fill_missing == "ffill":
-        merged[sentiment_cols] = merged.groupby(price_ticker_col)[sentiment_cols].ffill()
-        logger.info(f"Forward-filled {missing_count} rows with last known sentiment")
+        ffill_limit = int(os.getenv("SENTIMENT_FFILL_LIMIT", "24"))
+        merged[sentiment_cols] = merged.groupby(price_ticker_col)[sentiment_cols].ffill(limit=ffill_limit)
+        merged['sentiment_imputed'] = (pre_fill_missing & merged['avg_sentiment'].notna()).astype(int)
+        logger.info(
+            f"Forward-filled {missing_count} rows with last known sentiment "
+            f"(limit={ffill_limit} bars)"
+        )
     elif fill_missing == "drop":
         merged = merged.dropna(subset=['avg_sentiment'])
+        merged['sentiment_imputed'] = 0
         logger.info(f"Dropped {missing_count} rows without sentiment data")
+    else:
+        # keep NaN path
+        merged['sentiment_imputed'] = 0
     # elif fill_missing == "keep": do nothing
     
     logger.info(

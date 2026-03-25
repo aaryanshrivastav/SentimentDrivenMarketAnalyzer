@@ -28,7 +28,7 @@ DATA_DIR = PROJECT_ROOT / "data" / "market"
 # Two pulls per ticker (044917, 050259) → merge and deduplicate
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_prices(data_dir: Path) -> pd.DataFrame:
+def load_prices(data_dir: Path, ticker_filter: list[str] | None = None) -> pd.DataFrame:
     """
     Loads all prices_*.csv files, merges duplicate pulls per ticker,
     resamples to 1-hour OHLCV bars.
@@ -46,6 +46,10 @@ def load_prices(data_dir: Path) -> pd.DataFrame:
     raw = pd.concat(frames, ignore_index=True)
     raw["timestamp_utc"] = pd.to_datetime(raw["timestamp_utc"], utc=True)
     raw.columns = [c.strip() for c in raw.columns]
+
+    if ticker_filter:
+        allowed = {str(t).strip().upper() for t in ticker_filter if str(t).strip()}
+        raw = raw[raw["ticker"].astype(str).str.upper().isin(allowed)].copy()
 
     # Deduplicate: same ticker + same timestamp from two pulls → keep one
     raw = raw.drop_duplicates(subset=["timestamp_utc", "ticker"])
@@ -340,6 +344,7 @@ def add_target(df: pd.DataFrame, threshold: float = 0.005) -> pd.DataFrame:
 def build_feature_matrix(
     sentiment_features: pd.DataFrame = None,   # output of Stage 1C
     data_dir: Path = DATA_DIR,
+    ticker_filter: list[str] | None = None,
 ) -> pd.DataFrame:
     """
     Returns the full fused feature matrix, one row per (ticker, hour).
@@ -347,7 +352,7 @@ def build_feature_matrix(
     """
 
     # ── Market data ──────────────────────────────────────────────────
-    prices   = load_prices(data_dir)
+    prices   = load_prices(data_dir, ticker_filter=ticker_filter)
     prices   = add_technical_features(prices)
 
     vix      = load_vix(data_dir)

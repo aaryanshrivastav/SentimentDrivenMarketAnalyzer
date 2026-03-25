@@ -30,6 +30,31 @@ from datetime import datetime, timezone
 logger = logging.getLogger(__name__)
 
 
+def _symbol_candidates(ticker: str) -> list[str]:
+    """Return fallback symbol candidates for Yahoo Finance lookups."""
+    t = str(ticker).strip().upper()
+    candidates = [t]
+
+    if t.endswith(".NS"):
+        candidates.append(t.replace(".NS", ".NSE"))
+        candidates.append(t.replace(".NS", ".BO"))
+        candidates.append(t.replace(".NS", ".BSE"))
+    elif t.endswith(".NSE"):
+        candidates.append(t.replace(".NSE", ".NS"))
+        candidates.append(t.replace(".NSE", ".BO"))
+        candidates.append(t.replace(".NSE", ".BSE"))
+    elif t.endswith(".BO"):
+        candidates.append(t.replace(".BO", ".BSE"))
+        candidates.append(t.replace(".BO", ".NS"))
+        candidates.append(t.replace(".BO", ".NSE"))
+    elif t.endswith(".BSE"):
+        candidates.append(t.replace(".BSE", ".BO"))
+        candidates.append(t.replace(".BSE", ".NS"))
+        candidates.append(t.replace(".BSE", ".NSE"))
+
+    return list(dict.fromkeys(candidates))
+
+
 def fetch_ohlcv(ticker: str, period: str = None, interval: str = None) -> pd.DataFrame:
     """
     Download OHLCV data for a ticker using yfinance.
@@ -40,10 +65,18 @@ def fetch_ohlcv(ticker: str, period: str = None, interval: str = None) -> pd.Dat
 
     logger.info(f"Fetching OHLCV: {ticker} | period={period} | interval={interval}")
 
-    df = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=True)
+    df = pd.DataFrame()
+    used_symbol = ticker
+    for symbol in _symbol_candidates(ticker):
+        used_symbol = symbol
+        df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=True)
+        if not df.empty:
+            if symbol != ticker:
+                logger.warning("%s unavailable, using fallback symbol %s", ticker, symbol)
+            break
 
     if df.empty:
-        logger.warning(f"No OHLCV data returned for {ticker}")
+        logger.warning(f"No OHLCV data returned for {ticker} (tried: {_symbol_candidates(ticker)})")
         return df
 
     df.index = df.index.tz_convert("UTC")
@@ -52,10 +85,14 @@ def fetch_ohlcv(ticker: str, period: str = None, interval: str = None) -> pd.Dat
 
     cols = [c for c in ["timestamp_utc", "Open", "High", "Low", "Close", "Volume"] if c in df.columns]
     df = df[cols].copy()
+    # Keep canonical requested ticker so downstream joins remain stable.
     df["ticker"] = ticker
     df["timestamp_utc"] = df["timestamp_utc"].dt.strftime(TIMESTAMP_FORMAT)
 
-    logger.info(f"{ticker}: {len(df)} rows ({df['timestamp_utc'].iloc[0]} to {df['timestamp_utc'].iloc[-1]})")
+    logger.info(
+        f"{ticker}: {len(df)} rows ({df['timestamp_utc'].iloc[0]} to {df['timestamp_utc'].iloc[-1]})"
+        + (f" [source symbol={used_symbol}]" if used_symbol != ticker else "")
+    )
     return df
 
 
@@ -122,15 +159,45 @@ def fetch_earnings_dates(ticker: str) -> pd.DataFrame:
     logger.info(f"Fetching earnings dates for {ticker}")
     try:
         cal = yf.Ticker(ticker).calendar
-        if cal is None or cal.empty:
+
+        if cal is None:
             logger.warning(f"No earnings calendar found for {ticker}")
             return pd.DataFrame(columns=["ticker", "earnings_date"])
 
         earnings_dates = []
-        if "Earnings Date" in cal.index:
-            for val in cal.loc["Earnings Date"]:
-                if pd.notna(val):
+
+        # yfinance may return DataFrame, Series, or dict depending on version/symbol.
+        if isinstance(cal, pd.DataFrame):
+            if cal.empty:
+                logger.warning(f"No earnings calendar found for {ticker}")
+                return pd.DataFrame(columns=["ticker", "earnings_date"])
+
+            if "Earnings Date" in cal.index:
+                values = cal.loc["Earnings Date"]
+                values = values if isinstance(values, (pd.Series, list, tuple)) else [values]
+                for val in values:
+                    if pd.notna(val):
+                        earnings_dates.append(str(val)[:10])
+            elif "Earnings Date" in cal.columns:
+                for val in cal["Earnings Date"].tolist():
+                    if pd.notna(val):
+                        earnings_dates.append(str(val)[:10])
+
+        elif isinstance(cal, pd.Series):
+            values = cal.get("Earnings Date", None)
+            values = values if isinstance(values, (list, tuple, pd.Series)) else [values]
+            for val in values:
+                if val is not None and pd.notna(val):
                     earnings_dates.append(str(val)[:10])
+
+        elif isinstance(cal, dict):
+            values = cal.get("Earnings Date", None)
+            values = values if isinstance(values, (list, tuple, pd.Series)) else [values]
+            for val in values:
+                if val is not None and pd.notna(val):
+                    earnings_dates.append(str(val)[:10])
+
+        earnings_dates = sorted({d for d in earnings_dates if d and d.lower() != "none"})
 
         df = pd.DataFrame({"ticker": ticker, "earnings_date": earnings_dates})
         logger.info(f"{ticker} earnings dates: {earnings_dates}")

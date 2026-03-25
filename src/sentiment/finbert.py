@@ -13,12 +13,15 @@ Usage:
 """
 
 import torch
+import torch.nn as nn
 import numpy as np
 import pandas as pd
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from torch.nn.functional import softmax
 from typing import Optional
 import logging
+import os
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -46,16 +49,63 @@ class FinBERTEngine:
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
+
+        if self.device == "cpu":
+            self._configure_cpu_runtime()
+
+        self.batch_size = self._effective_batch_size()
         logger.info(f"Loading FinBERT on {self.device}...")
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model     = AutoModelForSequenceClassification.from_pretrained(model_name)
+        if self.device == "cpu":
+            self._maybe_quantize_model()
         self.model.to(self.device)
         self.model.eval()
 
         # HuggingFace finbert labels: positive / negative / neutral (order matters)
         self.id2label = self.model.config.id2label          # {0: 'positive', 1: 'negative', 2: 'neutral'}
         logger.info(f"Label map from model config: {self.id2label}")
+        logger.info(f"FinBERT batch size: {self.batch_size}")
+
+    def _configure_cpu_runtime(self):
+        """Tune PyTorch CPU threading; overridable with FINBERT_CPU_THREADS."""
+        cpu_count = os.cpu_count() or 4
+        default_threads = max(2, min(8, cpu_count - 2))
+        env_threads = os.getenv("FINBERT_CPU_THREADS", "")
+        try:
+            threads = int(env_threads) if env_threads else default_threads
+            threads = max(1, threads)
+            torch.set_num_threads(threads)
+            logger.info("FinBERT CPU threads set to %d", threads)
+        except ValueError:
+            logger.warning("Invalid FINBERT_CPU_THREADS='%s'. Using defaults.", env_threads)
+
+    def _maybe_quantize_model(self):
+        """Optional dynamic quantization on CPU for faster linear layers."""
+        quantize = os.getenv("FINBERT_CPU_QUANTIZE", "1") == "1"
+        if not quantize:
+            return
+        try:
+            self.model = torch.quantization.quantize_dynamic(
+                self.model,
+                {nn.Linear},
+                dtype=torch.qint8,
+            )
+            logger.info("Enabled dynamic quantization for FinBERT (CPU)")
+        except Exception as exc:
+            logger.warning("Could not quantize FinBERT model; continuing without quantization: %s", exc)
+
+    def _effective_batch_size(self) -> int:
+        env_bs = os.getenv("FINBERT_BATCH_SIZE", "")
+        if env_bs:
+            try:
+                parsed = int(env_bs)
+                if parsed > 0:
+                    return parsed
+            except ValueError:
+                logger.warning("Invalid FINBERT_BATCH_SIZE='%s'. Using defaults.", env_bs)
+        return 64 if self.device == "cpu" else 128
 
     # ------------------------------------------------------------------
     def predict(self, texts: list[str]) -> list[dict]:
@@ -71,8 +121,16 @@ class FinBERTEngine:
         """
         all_results = []
 
-        for batch_start in range(0, len(texts), BATCH_SIZE):
-            batch = texts[batch_start : batch_start + BATCH_SIZE]
+        total_batches = (len(texts) + self.batch_size - 1) // self.batch_size if texts else 0
+        batch_iter = range(0, len(texts), self.batch_size)
+
+        for batch_start in tqdm(
+            batch_iter,
+            total=total_batches,
+            desc=f"FinBERT inference ({self.device}, bs={self.batch_size})",
+            unit="batch",
+        ):
+            batch = texts[batch_start : batch_start + self.batch_size]
             encoded = self.tokenizer(
                 batch,
                 padding=True,
@@ -81,7 +139,7 @@ class FinBERTEngine:
                 return_tensors="pt",
             ).to(self.device)
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 logits = self.model(**encoded).logits           # (B, 3)
             probs = softmax(logits, dim=-1).cpu().numpy()       # (B, 3)
 
@@ -128,15 +186,64 @@ def run_finbert_stage(
     if engine is None:
         engine = FinBERTEngine()
 
-    texts   = df[text_col].fillna("").tolist()
-    results = engine.predict(texts)
-
-    labels        = [r["label"]        for r in results]
-    numerics      = [r["numeric"]      for r in results]
-    confidences   = [r["confidence"]   for r in results]
-    is_uncertains = [r["is_uncertain"] for r in results]
+    score_only_unlabeled = os.getenv("FINBERT_ONLY_UNLABELED", "0") == "1"
 
     df = df.copy()
+
+    if score_only_unlabeled and "original_label_available" in df.columns:
+        to_score_mask = ~df["original_label_available"].fillna(False)
+        score_idx = df.index[to_score_mask].tolist()
+        passthrough_idx = df.index[~to_score_mask].tolist()
+
+        texts = df.loc[score_idx, text_col].fillna("").tolist()
+        logger.info(
+            "FinBERT scoring scope: %d/%d rows (FINBERT_ONLY_UNLABELED=1)",
+            len(texts), len(df)
+        )
+        scored_results = engine.predict(texts)
+
+        # Initialize arrays for whole DataFrame and fill from scored + passthrough rows.
+        labels = [None] * len(df)
+        numerics = [0] * len(df)
+        confidences = [0.0] * len(df)
+        is_uncertains = [True] * len(df)
+
+        pos_by_idx = {idx: pos for pos, idx in enumerate(df.index.tolist())}
+
+        # Fill model outputs for unlabeled rows.
+        for idx, r in zip(score_idx, scored_results):
+            p = pos_by_idx[idx]
+            labels[p] = r["label"]
+            numerics[p] = r["numeric"]
+            confidences[p] = r["confidence"]
+            is_uncertains[p] = r["is_uncertain"]
+
+        # Preserve existing labels for originally labeled rows without model call.
+        label_norm_map = {
+            "bullish": ("positive", 1),
+            "bearish": ("negative", -1),
+            "neutral": ("neutral", 0),
+            "positive": ("positive", 1),
+            "negative": ("negative", -1),
+        }
+        for idx in passthrough_idx:
+            p = pos_by_idx[idx]
+            raw = str(df.at[idx, "sentiment_label"]).strip().lower()
+            mapped_label, mapped_num = label_norm_map.get(raw, ("neutral", 0))
+            labels[p] = mapped_label
+            numerics[p] = mapped_num
+            confidences[p] = 1.0
+            is_uncertains[p] = False
+    else:
+        texts = df[text_col].fillna("").tolist()
+        logger.info("FinBERT scoring scope: %d/%d rows", len(texts), len(df))
+        results = engine.predict(texts)
+
+        labels        = [r["label"]        for r in results]
+        numerics      = [r["numeric"]      for r in results]
+        confidences   = [r["confidence"]   for r in results]
+        is_uncertains = [r["is_uncertain"] for r in results]
+
     df["sentiment_label"]      = labels
     df["sentiment_numeric"]    = numerics
     df["sentiment_confidence"] = confidences

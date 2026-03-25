@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import AsyncIterator
 
 from fastapi import FastAPI
+from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -31,7 +32,7 @@ PROJECT_ROOT = Path(__file__).parent
 PYTHON_EXE = sys.executable  # Use the same Python as the API server
 
 
-async def stream_pipeline_logs() -> AsyncIterator[str]:
+async def stream_pipeline_logs(request: Request) -> AsyncIterator[str]:
     """
     Run test.py and stream logs in real-time as Server-Sent Events (SSE).
     
@@ -48,6 +49,8 @@ async def stream_pipeline_logs() -> AsyncIterator[str]:
     start_data = json.dumps({"type": "start", "timestamp": start_time})
     yield f"data: {start_data}\n\n"
     
+    process = None
+
     try:
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -58,6 +61,13 @@ async def stream_pipeline_logs() -> AsyncIterator[str]:
         
         if process.stdout:
             async for line_bytes in process.stdout:
+                # Stop streaming immediately if the client closes the SSE connection.
+                if await request.is_disconnected():
+                    if process.returncode is None:
+                        process.terminate()
+                        await process.wait()
+                    return
+
                 line = line_bytes.decode('utf-8', errors='ignore').strip()
                 if not line:
                     continue
@@ -102,6 +112,10 @@ async def stream_pipeline_logs() -> AsyncIterator[str]:
         
         # Wait for process to complete
         await process.wait()
+
+        # If the client disconnected while the process ended, skip final SSE frame.
+        if await request.is_disconnected():
+            return
         
         # Send completion event
         end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -112,6 +126,12 @@ async def stream_pipeline_logs() -> AsyncIterator[str]:
             complete_data = json.dumps({"type": "complete", "timestamp": end_time, "success": False, "exit_code": process.returncode})
             yield f"data: {complete_data}\n\n"
     
+    except asyncio.CancelledError:
+        # Raised when the response stream is cancelled (e.g., browser tab closed).
+        if process and process.returncode is None:
+            process.terminate()
+            await process.wait()
+        return
     except Exception as e:
         error_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         error_data = json.dumps({"type": "error", "timestamp": error_time, "message": str(e)})
@@ -153,14 +173,14 @@ async def root():
 
 
 @app.get("/api/pipeline/run")
-async def run_pipeline():
+async def run_pipeline(request: Request):
     """
     Start the pipeline execution and stream logs in real-time.
     
     Returns a Server-Sent Events (SSE) stream.
     """
     return StreamingResponse(
-        stream_pipeline_logs(),
+        stream_pipeline_logs(request),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -195,6 +215,9 @@ async def pipeline_status():
 
 if __name__ == "__main__":
     import uvicorn
+    if sys.platform == "win32":
+        # Selector policy avoids noisy Proactor shutdown tracebacks on client disconnect.
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     print("🚀 Starting Sentiment Market Analyzer API Server...")
     print("📊 Frontend: http://localhost:3000")
     print("🔌 API: http://localhost:8000")

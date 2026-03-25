@@ -16,6 +16,7 @@ training code can query "should I use sentiment for TICKER?" automatically.
 # ── Imports ────────────────────────────────────────────────────────────────────
 import json
 import warnings
+import os
 import numpy as np
 import pandas as pd
 
@@ -24,6 +25,22 @@ from typing import Optional
 from statsmodels.tsa.stattools import grangercausalitytests, adfuller
 
 warnings.filterwarnings("ignore")
+
+
+def _is_constant(series: pd.Series) -> bool:
+    clean = series.dropna()
+    if len(clean) == 0:
+        return True
+    return clean.nunique() <= 1
+
+
+def _inject_tiny_jitter(series: pd.Series, scale: float = 1e-8) -> pd.Series:
+    """Inject deterministic epsilon trend to avoid constant-series numerical failures."""
+    clean = series.copy()
+    if len(clean) == 0:
+        return clean
+    eps = np.linspace(0.0, scale, num=len(clean))
+    return clean + eps
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -47,7 +64,24 @@ def check_stationarity(series: pd.Series, name: str = "series", verbose: bool = 
     If non-stationary, the caller should first-difference the series.
     """
     clean = series.dropna()
-    result = adfuller(clean, autolag="AIC")
+    if len(clean) < 8:
+        if verbose:
+            print(f"  ADF [{name}]: insufficient length ({len(clean)}), treat as non-stationary")
+        return False
+
+    if _is_constant(clean):
+        if verbose:
+            print(f"  ADF [{name}]: constant series, treat as stationary for preprocessing")
+        return True
+
+    try:
+        result = adfuller(clean, autolag="AIC")
+    except ValueError as exc:
+        if "constant" in str(exc).lower():
+            if verbose:
+                print(f"  ADF [{name}]: constant input encountered, treat as stationary")
+            return True
+        raise
     p_val  = result[1]
     is_stationary = p_val < P_VALUE_THRESH
 
@@ -131,6 +165,27 @@ def run_granger_test(
     # Re-align after possible differencing
     test_df = pd.concat([price_stat, sentiment_stat], axis=1).dropna()
     test_df.columns = ["price", "sentiment"]
+
+    if len(test_df) < max_lags * 5:
+        warnings.warn(f"[{ticker}] Too few rows after stationarity/alignment: {len(test_df)}")
+        return _build_result(ticker, max_lags, {}, p_thresh, failed=True)
+
+    # Optional rescue for constant series after filling/alignment.
+    allow_jitter = os.getenv("GRANGER_ALLOW_CONSTANT_JITTER", "1") == "1"
+    if _is_constant(test_df["price"]) or _is_constant(test_df["sentiment"]):
+        if allow_jitter:
+            warnings.warn(
+                f"[{ticker}] Constant series detected post-preprocessing; injecting tiny jitter for numerical stability."
+            )
+            if _is_constant(test_df["price"]):
+                test_df["price"] = _inject_tiny_jitter(test_df["price"])
+            if _is_constant(test_df["sentiment"]):
+                test_df["sentiment"] = _inject_tiny_jitter(test_df["sentiment"])
+        else:
+            warnings.warn(
+                f"[{ticker}] Constant series detected and jitter disabled; excluding ticker from Granger."
+            )
+            return _build_result(ticker, max_lags, {}, p_thresh, failed=True)
 
     if verbose:
         print(f"\n  ── Granger test (lags 1–{max_lags}) ──")
@@ -253,14 +308,18 @@ def run_granger_batch(
     all_results = []
 
     for ticker, (price, sentiment) in ticker_data.items():
-        result = run_granger_test(
-            price_series     = price,
-            sentiment_series = sentiment,
-            ticker           = ticker,
-            max_lags         = max_lags,
-            p_thresh         = p_thresh,
-            verbose          = verbose,
-        )
+        try:
+            result = run_granger_test(
+                price_series     = price,
+                sentiment_series = sentiment,
+                ticker           = ticker,
+                max_lags         = max_lags,
+                p_thresh         = p_thresh,
+                verbose          = verbose,
+            )
+        except Exception as e:
+            warnings.warn(f"[{ticker}] Granger test crashed and will be excluded: {e}")
+            result = _build_result(ticker, max_lags, {}, p_thresh, failed=True)
         all_results.append(result)
 
     summary_df = _build_summary_table(all_results)
